@@ -1,4 +1,4 @@
-name: 下载、重新打包并上传到 Release (WinRAR 压缩)
+name: 下载、重新打包并上传到 Release
 
 on:
   workflow_dispatch:
@@ -22,10 +22,8 @@ jobs:
   process-and-upload:
     runs-on: ubuntu-latest
     steps:
-      - name: 安装依赖（7z 用于解压，rar 用于压缩）
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq p7zip-full rar
+      - name: 安装 p7zip-full
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq p7zip-full
 
       - name: 处理所有任务
         shell: bash
@@ -80,7 +78,7 @@ jobs:
 
               cd "$TASK_DIR"
 
-              # 下载
+              # 下载（重试三次）
               echo "下载：$URL"
               for i in 1 2 3; do
                 if curl -fsSL --retry 2 -o download.pkg "$URL"; then
@@ -93,7 +91,7 @@ jobs:
               done
               [[ -f download.pkg ]] || { echo "下载失败"; exit 1; }
 
-              # 解压（使用 7z 通用解压，支持密码）
+              # 解压（带密码支持）
               echo "解压..."
               mkdir -p extract
               if [[ -n "$PASSWORD" ]]; then
@@ -102,32 +100,41 @@ jobs:
                 7z x -oextract download.pkg -y
               fi
 
-              # 重组为单层文件夹（修正版：直接重命名子目录，避免通配符问题）
+              # 重组为单层文件夹
               echo "重组文件夹结构..."
               mapfile -t items < <(find extract -mindepth 1 -maxdepth 1)
               if [[ ${#items[@]} -eq 1 ]] && [[ -d "${items[0]}" ]]; then
-                echo "检测到唯一子目录，直接将其作为 ${OUTPUT_NAME}/"
-                mv "${items[0]}" "${OUTPUT_NAME}"
+                echo "检测到唯一子目录，上提内容到 ${OUTPUT_NAME}/"
+                mkdir -p "${OUTPUT_NAME}"
+                mv "${items[0]}"/* "${items[0]}"/.[!.]* "${OUTPUT_NAME}"/ 2>/dev/null || true
               else
                 echo "多文件或非目录，将 extract 作为 ${OUTPUT_NAME}/"
                 mv extract "${OUTPUT_NAME}"
               fi
               [[ -d "${OUTPUT_NAME}" ]] || { echo "重组失败"; exit 1; }
 
-              # ========== WinRAR 压缩（RAR5，标准压缩，恢复记录，128MB 字典，分卷 1.9GB）==========
-              echo "WinRAR 分卷压缩 (标准压缩, rr, 128MB 字典)..."
-              rar a -ma5 -m3 -rr -md128m -v1900m "${OUTPUT_NAME}.rar" "${OUTPUT_NAME}/"
+              # 分卷压缩（标准压缩率，每卷最大 1.9 GB）
+              echo "压缩（标准压缩率，分卷 1.9G）..."
+              7z a -tzip -v1900m -mx=5 "${OUTPUT_NAME}.zip" "${OUTPUT_NAME}/"
 
-              # 上传：匹配所有以 OUTPUT_NAME.rar 开头的文件（涵盖 .rar, .part1.rar 等）
+              # 智能处理：若最终只有一个分卷（.zip.001），则重命名为标准 .zip
+              first_volume="${OUTPUT_NAME}.zip.001"
+              if [[ -f "$first_volume" ]] &&
+                 [[ ! -f "${OUTPUT_NAME}.zip.002" ]] &&
+                 [[ ! -f "${OUTPUT_NAME}.z01" ]]; then
+                echo "只有一卷，重命名 ${first_volume} -> ${OUTPUT_NAME}.zip"
+                mv "$first_volume" "${OUTPUT_NAME}.zip"
+              fi
+
+              # 收集所有分卷文件并上传
               echo "上传到 release..."
               ASSETS=()
               while IFS= read -r -d '' file; do
                 ASSETS+=("$file")
-              done < <(find . -maxdepth 1 -name "${OUTPUT_NAME}.rar*" -print0 2>/dev/null || true)
+              done < <(find . -maxdepth 1 -name "${OUTPUT_NAME}.zip*" -print0 2>/dev/null || true)
 
               if [[ ${#ASSETS[@]} -eq 0 ]]; then
-                echo "错误：未找到任何压缩分卷文件。"
-                echo "当前目录内容："
+                echo "错误：未找到任何压缩文件。"
                 ls -la
                 exit 1
               fi
