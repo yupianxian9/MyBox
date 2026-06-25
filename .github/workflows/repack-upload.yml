@@ -35,10 +35,10 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 清理所有 Windows 换行符（包括 JSON 和各字段）
+          # 清理所有 Windows 换行符（\r）
           export TASKS_JSON="$(printf '%s' "$TASKS_JSON" | tr -d '\r')"
 
-          # 容错：移除 JSON 数组/对象末尾多余逗号
+          # 容错：移除 JSON 末尾多余逗号
           export TASKS_JSON="$(printf '%s' "$TASKS_JSON" | sed -Ez 's/,\s*(]|})/\1/g')"
 
           COUNT=$(jq -n 'env.TASKS_JSON | fromjson | length')
@@ -63,7 +63,7 @@ jobs:
               OUTPUT_NAME_RAW=$(jq -rn --argjson i "$idx" 'env.TASKS_JSON | fromjson | .[$i].output_name')
               PASSWORD=$(jq -rn --argjson i "$idx" 'env.TASKS_JSON | fromjson | .[$i].password // ""')
 
-              # 再次剔除 \r（以防字段级残留）
+              # 再次剔除 \r（确保字段级干净）
               OUTPUT_NAME="$(printf '%s' "$OUTPUT_NAME_RAW" | tr -d '\r')"
 
               if [[ -z "$URL" || -z "$OUTPUT_NAME" ]]; then
@@ -113,29 +113,27 @@ jobs:
               fi
               [[ -d "${OUTPUT_NAME}" ]] || { echo "重组失败"; exit 1; }
 
-              # 分卷压缩
+              # 分卷压缩（最高压缩率，每卷 1.9 GB）
               echo "最高压缩率分卷 ZIP (每卷 1.9G)..."
               7z a -tzip -v1900m -mx=9 "${OUTPUT_NAME}.zip" "${OUTPUT_NAME}/"
 
-              # 调试：列出当前目录所有文件
-              echo "当前目录内容："
-              ls -la
-
-              # 上传：使用 find 安全收集所有分卷文件（包括仅有一卷的情况）
+              # 上传：匹配所有以 OUTPUT_NAME.zip 开头的文件（涵盖 .zip、.z01、.zip.001 等）
               echo "上传到 release..."
               ASSETS=()
               while IFS= read -r -d '' file; do
                 ASSETS+=("$file")
-              done < <(find . -maxdepth 1 \( -name "${OUTPUT_NAME}.zip" -o -name "${OUTPUT_NAME}.z[0-9][0-9]" \) -print0 2>/dev/null || true)
+              done < <(find . -maxdepth 1 -name "${OUTPUT_NAME}.zip*" -print0 2>/dev/null || true)
 
               if [[ ${#ASSETS[@]} -eq 0 ]]; then
-                echo "错误：未找到任何压缩文件（可能文件名不匹配），目录内容如上。"
+                echo "错误：未找到任何压缩分卷文件。"
+                echo "当前目录内容："
+                ls -la
                 exit 1
               fi
               gh release upload "${TAG}" "${ASSETS[@]}" --clobber
 
               echo "任务完成：$OUTPUT_NAME"
-              # trap 自动清理
+              # 退出子shell时自动清理
             ) || echo "⚠️ 任务 $idx 失败，继续下一个"
           done
 
