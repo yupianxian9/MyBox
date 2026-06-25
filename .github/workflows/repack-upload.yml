@@ -5,12 +5,8 @@ on:
     inputs:
       tasks:
         description: >
-          JSON 数组，每个元素包含：
-          - url: 下载地址
-          - output_name: 最终文件夹名及压缩包前缀
-          - password: 解压密码（无密码留空字符串）
-          示例：
-          [{"url":"https://...", "output_name":"MyApp", "password":"123"}]
+          JSON 数组，每个元素包含 url, output_name, password。
+          示例：[{"url":"https://...", "output_name":"MyApp", "password":"123"}]
         required: true
         type: string
       tag:
@@ -20,7 +16,7 @@ on:
         default: 'latest'
 
 permissions:
-  contents: write    # 用于创建/更新 release 并上传 asset
+  contents: write
 
 jobs:
   process-and-upload:
@@ -34,17 +30,18 @@ jobs:
         env:
           TASKS_JSON: ${{ github.event.inputs.tasks }}
           TAG: ${{ github.event.inputs.tag }}
-          GH_TOKEN: ${{ github.token }}      # 必须，供 gh CLI 使用
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}   # 关键：使 gh 不依赖本地 git 仓库
         run: |
           set -euo pipefail
 
-          # ---- 容错：移除 JSON 数组/对象末尾多余逗号（支持多行）----
+          # 容错：移除 JSON 数组/对象末尾多余逗号（支持多行）
           export TASKS_JSON="$(printf '%s' "$TASKS_JSON" | sed -Ez 's/,\s*(]|})/\1/g')"
 
           COUNT=$(jq -n 'env.TASKS_JSON | fromjson | length')
           echo "共有 ${COUNT} 个任务"
 
-          # ---- 确保目标 release 存在 ----
+          # 确保 release 存在
           if ! gh release view "${TAG}" &>/dev/null; then
             echo "创建 release: ${TAG}"
             gh release create "${TAG}" --title "${TAG}" --notes "自动化重新打包上传"
@@ -52,7 +49,7 @@ jobs:
             echo "release ${TAG} 已存在，将上传 asset"
           fi
 
-          # ---- 逐个任务处理，子 shell 隔离错误并即时清理 ----
+          # 逐个任务处理，子 shell 隔离错误并即时清理
           for ((idx=0; idx<COUNT; idx++)); do
             echo "========================================="
             echo ">>> 任务 $((idx+1))/${COUNT}"
@@ -76,7 +73,7 @@ jobs:
 
               cd "$TASK_DIR"
 
-              # ---- 下载（重试三次）----
+              # 下载（重试三次）
               echo "下载：$URL"
               for i in 1 2 3; do
                 if curl -fsSL --retry 2 -o download.pkg "$URL"; then
@@ -89,7 +86,7 @@ jobs:
               done
               [[ -f download.pkg ]] || { echo "下载失败"; exit 1; }
 
-              # ---- 解压（带密码支持）----
+              # 解压（带密码支持）
               echo "解压..."
               mkdir -p extract
               if [[ -n "$PASSWORD" ]]; then
@@ -98,7 +95,7 @@ jobs:
                 7z x -oextract download.pkg -y
               fi
 
-              # ---- 重组为单层文件夹 ----
+              # 重组为单层文件夹
               echo "重组文件夹结构..."
               mapfile -t items < <(find extract -mindepth 1 -maxdepth 1)
               if [[ ${#items[@]} -eq 1 ]] && [[ -d "${items[0]}" ]]; then
@@ -111,11 +108,11 @@ jobs:
               fi
               [[ -d "${OUTPUT_NAME}" ]] || { echo "重组失败"; exit 1; }
 
-              # ---- 分卷压缩（zip，最高压缩率，每卷1.9G）----
+              # 分卷压缩（zip，最高压缩率，每卷1.9G）
               echo "最高压缩率分卷 ZIP (每卷 1.9G)..."
               7z a -tzip -v1900m -mx=9 "${OUTPUT_NAME}.zip" "${OUTPUT_NAME}/"
 
-              # ---- 上传所有分卷到 release ----
+              # 上传所有分卷到 release
               echo "上传到 release..."
               ASSETS=()
               for f in "${OUTPUT_NAME}".zip "${OUTPUT_NAME}".z[0-9][0-9]; do
@@ -125,7 +122,7 @@ jobs:
               gh release upload "${TAG}" "${ASSETS[@]}" --clobber
 
               echo "任务完成：$OUTPUT_NAME"
-              # 退出子 shell 时 trap 自动删除临时目录
+              # 子shell退出时 trap 自动清理
             ) || echo "⚠️ 任务 $idx 失败，继续下一个"
           done
 
