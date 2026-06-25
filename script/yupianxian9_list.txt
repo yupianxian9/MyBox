@@ -1,0 +1,7 @@
+![Adblock Plus 2.0]
+! Title: yupianxian9_list
+cn.bing.com##div#sacs_win > div.sacs_popup > div.sacs_mtit
+cn.bing.com##div#sacs_win > div.sacs_popup > div.sacs_con
+cn.bing.com##div#sacs_win
+
+
