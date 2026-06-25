@@ -102,24 +102,23 @@ jobs:
                 7z x -oextract download.pkg -y
               fi
 
-              # 重组为单层文件夹
+              # 重组为单层文件夹（修正版：直接重命名子目录，避免通配符问题）
               echo "重组文件夹结构..."
               mapfile -t items < <(find extract -mindepth 1 -maxdepth 1)
               if [[ ${#items[@]} -eq 1 ]] && [[ -d "${items[0]}" ]]; then
-                echo "检测到唯一子目录，上提内容到 ${OUTPUT_NAME}/"
-                mkdir -p "${OUTPUT_NAME}"
-                mv "${items[0]}"/* "${items[0]}"/.[!.]* "${OUTPUT_NAME}"/ 2>/dev/null || true
+                echo "检测到唯一子目录，直接将其作为 ${OUTPUT_NAME}/"
+                mv "${items[0]}" "${OUTPUT_NAME}"
               else
                 echo "多文件或非目录，将 extract 作为 ${OUTPUT_NAME}/"
                 mv extract "${OUTPUT_NAME}"
               fi
               [[ -d "${OUTPUT_NAME}" ]] || { echo "重组失败"; exit 1; }
 
-              # ========== WinRAR 压缩（RAR5 格式，标准压缩，恢复记录，128MB 字典，分卷 1.9GB）==========
+              # ========== WinRAR 压缩（RAR5，标准压缩，恢复记录，128MB 字典，分卷 1.9GB）==========
               echo "WinRAR 分卷压缩 (标准压缩, rr, 128MB 字典)..."
               rar a -ma5 -m3 -rr -md128m -v1900m "${OUTPUT_NAME}.rar" "${OUTPUT_NAME}/"
 
-              # 上传：匹配所有以 OUTPUT_NAME.rar 开头的文件（涵盖 .rar, .part1.rar, .part2.rar 等）
+              # 上传：匹配所有以 OUTPUT_NAME.rar 开头的文件（涵盖 .rar, .part1.rar 等）
               echo "上传到 release..."
               ASSETS=()
               while IFS= read -r -d '' file; do
@@ -135,7 +134,7 @@ jobs:
               gh release upload "${TAG}" "${ASSETS[@]}" --clobber
 
               echo "任务完成：$OUTPUT_NAME"
-              # 子shell退出时自动清理
+              # 退出子shell时自动清理
             ) || echo "⚠️ 任务 $idx 失败，继续下一个"
           done
 
