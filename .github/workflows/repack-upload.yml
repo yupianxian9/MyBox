@@ -1,0 +1,176 @@
+name: 下载、重新打包并上传到 Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tasks:
+        description: >
+          JSON 数组，每个元素包含：
+          - url: 下载地址（压缩包）
+          - output_name: 最终压缩包前缀及解压后的文件夹名
+          - password: 解压密码（无密码留空字符串）
+          示例：
+          [
+            {"url": "https://example.com/app.zip", "output_name": "MyApp", "password": "123456"},
+            {"url": "https://example.com/tool.rar", "output_name": "ToolSet", "password": ""}
+          ]
+        required: true
+        type: string
+      tag:
+        description: '目标 Release 的 tag（如 v1.0.0 或 latest），若不存在则自动创建'
+        required: true
+        type: string
+        default: 'latest'
+
+permissions:
+  contents: write  # 用于创建 release 及上传 asset
+
+jobs:
+  process-and-upload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 安装依赖（p7zip-full）
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq p7zip-full
+
+      - name: 处理所有任务
+        shell: bash
+        env:
+          TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          # 将输入的 JSON 写入临时文件，方便 jq 处理
+          TASKS_JSON="${{ github.event.inputs.tasks }}"
+          echo "$TASKS_JSON" > /tmp/tasks.json
+
+          # 获取任务数量
+          COUNT=$(jq length /tmp/tasks.json)
+          echo "共有 ${COUNT} 个任务待处理"
+
+          # 确保目标 release 存在（不存在则创建空 release）
+          echo "检查 tag '${TAG}' 对应的 release ..."
+          if ! gh release view "${TAG}" &>/dev/null; then
+            echo "release 不存在，自动创建。"
+            gh release create "${TAG}" --title "${TAG}" --notes "自动化重新打包上传"
+          else
+            echo "release 已存在，将上传 asset 到该 release。"
+          fi
+
+          # 循环处理每个任务
+          for ((idx=0; idx<COUNT; idx++)); do
+            echo "========================================="
+            echo "处理第 $((idx+1))/${COUNT} 个任务"
+            
+            # 读取当前任务参数
+            URL=$(jq -r ".[$idx].url" /tmp/tasks.json)
+            OUTPUT_NAME=$(jq -r ".[$idx].output_name" /tmp/tasks.json)
+            PASSWORD=$(jq -r ".[$idx].password" /tmp/tasks.json)
+
+            # 简单校验
+            if [[ -z "$URL" || -z "$OUTPUT_NAME" ]]; then
+              echo "错误：任务 $idx 的 url 或 output_name 为空，跳过。"
+              continue
+            fi
+
+            # 创建任务专属临时目录
+            TASK_DIR=$(mktemp -d -t task-XXXXX)
+            echo "临时目录：$TASK_DIR"
+            
+            # 清理函数，确保任何情况下都删除临时目录
+            cleanup() {
+              echo "清理临时目录：$TASK_DIR"
+              rm -rf "$TASK_DIR"
+            }
+            trap cleanup EXIT
+
+            # 进入临时目录
+            cd "$TASK_DIR"
+
+            # --- 下载 ---
+            echo "正在下载：$URL"
+            # 重试3次
+            for i in 1 2 3; do
+              if curl -fsSL --retry 2 -o download.pkg "$URL"; then
+                echo "下载成功。"
+                break
+              else
+                echo "下载失败，第 $i 次重试..."
+                sleep 5
+              fi
+            done
+            if [[ ! -f download.pkg ]]; then
+              echo "严重错误：下载失败，跳过此任务。"
+              continue
+            fi
+
+            # --- 解压（带密码） ---
+            echo "解压文件（若需密码将自动使用）..."
+            mkdir -p extract
+            if [[ -n "$PASSWORD" ]]; then
+              7z x -oextract -p"$PASSWORD" download.pkg -y || {
+                echo "解压失败，可能是密码错误或文件损坏，跳过此任务。"
+                continue
+              }
+            else
+              7z x -oextract download.pkg -y || {
+                echo "解压失败，文件可能损坏，跳过此任务。"
+                continue
+              }
+            fi
+
+            # --- 重组文件夹，确保最终压缩包内只有一层 output_name/ ---
+            echo "重组文件夹结构..."
+            # 统计 extract 下的条目数（不包括 . 和 ..）
+            mapfile -t items < <(find extract -mindepth 1 -maxdepth 1)
+            ITEM_COUNT=${#items[@]}
+
+            if [[ $ITEM_COUNT -eq 1 ]] && [[ -d "${items[0]}" ]]; then
+              # 只有一个子目录，将其内容上提
+              echo "检测到唯一子目录，上提其内容到 ${OUTPUT_NAME}/"
+              mkdir -p "${OUTPUT_NAME}"
+              # 移动该子目录下的所有内容到 OUTPUT_NAME，排除自身
+              mv "${items[0]}"/* "${items[0]}"/.[!.]* "${OUTPUT_NAME}"/ 2>/dev/null || true
+            else
+              # 多文件或非单目录，直接将 extract 重命名
+              echo "多文件或非目录结构，将 extract 作为 ${OUTPUT_NAME}/"
+              mv extract "${OUTPUT_NAME}"
+            fi
+
+            # 确保 OUTPUT_NAME 目录存在
+            if [[ ! -d "${OUTPUT_NAME}" ]]; then
+              echo "错误：重组后未能生成 ${OUTPUT_NAME}/ 目录，跳过。"
+              continue
+            fi
+
+            # --- 最高压缩率分卷压缩为 zip，每卷 1.9 GB ---
+            echo "开始压缩为分卷 ZIP（最高压缩率）..."
+            7z a -tzip -v1900m -mx=9 "${OUTPUT_NAME}.zip" "${OUTPUT_NAME}/" || {
+              echo "压缩失败。"
+              continue
+            }
+
+            # --- 上传所有分卷到 release ---
+            echo "上传分卷到 tag '${TAG}' 的 release..."
+            # 匹配所有以 OUTPUT_NAME.zip 或 OUTPUT_NAME.z* 开头的文件
+            ASSETS=()
+            for f in "${OUTPUT_NAME}".zip "${OUTPUT_NAME}".z[0-9][0-9]; do
+              [[ -f "$f" ]] && ASSETS+=("$f")
+            done
+            if [[ ${#ASSETS[@]} -eq 0 ]]; then
+              echo "错误：未找到任何分卷文件，跳过上传。"
+              continue
+            fi
+            gh release upload "${TAG}" "${ASSETS[@]}" --clobber || {
+              echo "上传失败。"
+              continue
+            }
+
+            echo "任务完成：$OUTPUT_NAME 已上传。"
+            # trap 会在函数结束时自动删除 TASK_DIR
+          done
+
+          echo "所有任务处理完毕。"
+          # 删除临时 tasks.json
+          rm -f /tmp/tasks.json
