@@ -5,19 +5,13 @@ on:
     inputs:
       tasks:
         description: >
-          JSON 数组，每个元素包含：
-          - url: 下载地址
-          - output_name: 最终压缩包前缀及解压后的文件夹名
-          - password: 解压密码（无密码留空字符串）
+          JSON 数组，每个元素包含 url, output_name, password。
           示例：
-          [
-            {"url": "https://example.com/app.zip", "output_name": "MyApp", "password": "123456"},
-            {"url": "https://example.com/tool.rar", "output_name": "ToolSet", "password": ""}
-          ]
+          [{"url":"https://...", "output_name":"MyApp", "password":"123"}]
         required: true
         type: string
       tag:
-        description: '目标 Release 的 tag（如 v1.0.0 或 latest），若不存在则自动创建'
+        description: '目标 Release 的 tag（如 v1.0.0 或 latest），不存在则自动创建'
         required: true
         type: string
         default: 'latest'
@@ -29,10 +23,8 @@ jobs:
   process-and-upload:
     runs-on: ubuntu-latest
     steps:
-      - name: 安装依赖（p7zip-full）
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq p7zip-full
+      - name: 安装依赖
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq p7zip-full
 
       - name: 处理所有任务
         shell: bash
@@ -42,122 +34,95 @@ jobs:
         run: |
           set -euo pipefail
 
-          # ---- 容错处理：自动移除 JSON 数组/对象末尾多余的逗号 ----
-          export TASKS_JSON=$(echo "$TASKS_JSON" | sed -E 's/,\s*(]|})/\1/g')
+          # 容错：移除 JSON 数组/对象末尾的多余逗号（支持多行）
+          export TASKS_JSON="$(printf '%s' "$TASKS_JSON" | sed -Ez 's/,\s*(]|})/\1/g')"
 
-          # 1. 解析任务数量
           COUNT=$(jq -n 'env.TASKS_JSON | fromjson | length')
-          echo "共有 ${COUNT} 个任务待处理"
+          echo "共有 ${COUNT} 个任务"
 
-          # 2. 确保目标 release 存在
-          echo "检查 tag '${TAG}' 对应的 release ..."
+          # 确保 release 存在
           if ! gh release view "${TAG}" &>/dev/null; then
-            echo "release 不存在，自动创建。"
+            echo "创建 release: ${TAG}"
             gh release create "${TAG}" --title "${TAG}" --notes "自动化重新打包上传"
           else
-            echo "release 已存在，将上传 asset 到该 release。"
+            echo "release ${TAG} 已存在，将上传 asset"
           fi
 
-          # 3. 循环处理每个任务
+          # 逐个任务处理，每个在子shell中执行，即时清理磁盘
           for ((idx=0; idx<COUNT; idx++)); do
             echo "========================================="
-            echo "处理第 $((idx+1))/${COUNT} 个任务"
+            echo ">>> 任务 $((idx+1))/${COUNT}"
 
-            URL=$(jq -rn --argjson i "$idx" 'env.TASKS_JSON | fromjson | .[$i].url')
-            OUTPUT_NAME=$(jq -rn --argjson i "$idx" 'env.TASKS_JSON | fromjson | .[$i].output_name')
-            PASSWORD=$(jq -rn --argjson i "$idx" 'env.TASKS_JSON | fromjson | .[$i].password // ""')
+            (
+              # 子shell，独立错误隔离
+              set -euo pipefail
 
-            if [[ -z "$URL" || -z "$OUTPUT_NAME" ]]; then
-              echo "错误：任务 $idx 的 url 或 output_name 为空，跳过。"
-              continue
-            fi
+              URL=$(jq -rn --argjson i "$idx" 'env.TASKS_JSON | fromjson | .[$i].url')
+              OUTPUT_NAME=$(jq -rn --argjson i "$idx" 'env.TASKS_JSON | fromjson | .[$i].output_name')
+              PASSWORD=$(jq -rn --argjson i "$idx" 'env.TASKS_JSON | fromjson | .[$i].password // ""')
 
-            # 创建临时目录
-            TASK_DIR=$(mktemp -d -t task-XXXXX)
-            echo "临时目录：$TASK_DIR"
-
-            cleanup() {
-              echo "清理临时目录：$TASK_DIR"
-              rm -rf "$TASK_DIR"
-            }
-            trap cleanup EXIT
-
-            cd "$TASK_DIR"
-
-            # --- 下载 ---
-            echo "正在下载：$URL"
-            for i in 1 2 3; do
-              if curl -fsSL --retry 2 -o download.pkg "$URL"; then
-                echo "下载成功。"
-                break
-              else
-                echo "下载失败，第 $i 次重试..."
-                sleep 5
+              if [[ -z "$URL" || -z "$OUTPUT_NAME" ]]; then
+                echo "错误：url 或 output_name 为空，跳过"
+                exit 0
               fi
-            done
-            if [[ ! -f download.pkg ]]; then
-              echo "严重错误：下载失败，跳过此任务。"
-              continue
-            fi
 
-            # --- 解压（带密码） ---
-            echo "解压文件..."
-            mkdir -p extract
-            if [[ -n "$PASSWORD" ]]; then
-              7z x -oextract -p"$PASSWORD" download.pkg -y || {
-                echo "解压失败（密码错误或文件损坏），跳过此任务。"
-                continue
-              }
-            else
-              7z x -oextract download.pkg -y || {
-                echo "解压失败，跳过此任务。"
-                continue
-              }
-            fi
+              TASK_DIR=$(mktemp -d -t task-XXXXX)
+              echo "临时目录：$TASK_DIR"
+              cleanup() { echo "清理 $TASK_DIR"; rm -rf "$TASK_DIR"; }
+              trap cleanup EXIT
 
-            # --- 重组文件夹，确保最终只有一层 output_name/ ---
-            echo "重组文件夹结构..."
-            mapfile -t items < <(find extract -mindepth 1 -maxdepth 1)
-            ITEM_COUNT=${#items[@]}
+              cd "$TASK_DIR"
 
-            if [[ $ITEM_COUNT -eq 1 ]] && [[ -d "${items[0]}" ]]; then
-              echo "检测到唯一子目录，上提其内容到 ${OUTPUT_NAME}/"
-              mkdir -p "${OUTPUT_NAME}"
-              mv "${items[0]}"/* "${items[0]}"/.[!.]* "${OUTPUT_NAME}"/ 2>/dev/null || true
-            else
-              echo "多文件或非目录结构，将 extract 作为 ${OUTPUT_NAME}/"
-              mv extract "${OUTPUT_NAME}"
-            fi
+              # 下载
+              echo "下载 $URL"
+              for i in 1 2 3; do
+                if curl -fsSL --retry 2 -o download.pkg "$URL"; then
+                  echo "下载成功"
+                  break
+                else
+                  echo "重试 $i ..."
+                  sleep 5
+                fi
+              done
+              [[ -f download.pkg ]] || { echo "下载失败"; exit 1; }
 
-            if [[ ! -d "${OUTPUT_NAME}" ]]; then
-              echo "错误：重组后未生成 ${OUTPUT_NAME}/ 目录，跳过。"
-              continue
-            fi
+              # 解压
+              echo "解压..."
+              mkdir -p extract
+              if [[ -n "$PASSWORD" ]]; then
+                7z x -oextract -p"$PASSWORD" download.pkg -y
+              else
+                7z x -oextract download.pkg -y
+              fi
 
-            # --- 分卷压缩（最高压缩率，每卷 1.9 GB） ---
-            echo "开始分卷 ZIP 压缩..."
-            7z a -tzip -v1900m -mx=9 "${OUTPUT_NAME}.zip" "${OUTPUT_NAME}/" || {
-              echo "压缩失败。"
-              continue
-            }
+              # 重组为单层文件夹
+              echo "重组..."
+              mapfile -t items < <(find extract -mindepth 1 -maxdepth 1)
+              if [[ ${#items[@]} -eq 1 ]] && [[ -d "${items[0]}" ]]; then
+                echo "上提子目录内容"
+                mkdir -p "${OUTPUT_NAME}"
+                mv "${items[0]}"/* "${items[0]}"/.[!.]* "${OUTPUT_NAME}"/ 2>/dev/null || true
+              else
+                mv extract "${OUTPUT_NAME}"
+              fi
+              [[ -d "${OUTPUT_NAME}" ]] || { echo "重组失败"; exit 1; }
 
-            # --- 上传所有分卷 ---
-            echo "上传分卷到 tag '${TAG}' 的 release..."
-            ASSETS=()
-            for f in "${OUTPUT_NAME}".zip "${OUTPUT_NAME}".z[0-9][0-9]; do
-              [[ -f "$f" ]] && ASSETS+=("$f")
-            done
-            if [[ ${#ASSETS[@]} -eq 0 ]]; then
-              echo "错误：未找到分卷文件，跳过上传。"
-              continue
-            fi
-            gh release upload "${TAG}" "${ASSETS[@]}" --clobber || {
-              echo "上传失败。"
-              continue
-            }
+              # 分卷压缩
+              echo "最高压缩率分卷 ZIP (每卷 1.9G)..."
+              7z a -tzip -v1900m -mx=9 "${OUTPUT_NAME}.zip" "${OUTPUT_NAME}/"
 
-            echo "任务完成：$OUTPUT_NAME 已上传。"
-            # trap 自动清理
+              # 上传
+              echo "上传到 release..."
+              ASSETS=()
+              for f in "${OUTPUT_NAME}".zip "${OUTPUT_NAME}".z[0-9][0-9]; do
+                [[ -f "$f" ]] && ASSETS+=("$f")
+              done
+              (( ${#ASSETS[@]} > 0 )) || { echo "无分卷文件"; exit 1; }
+              gh release upload "${TAG}" "${ASSETS[@]}" --clobber
+
+              echo "任务完成：$OUTPUT_NAME"
+              # 子shell退出时 trap 自动清理
+            ) || echo "⚠️ 任务 $idx 失败，继续下一个"
           done
 
-          echo "所有任务处理完毕。"
+          echo "所有任务处理完毕"
