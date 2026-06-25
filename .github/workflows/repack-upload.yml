@@ -1,4 +1,4 @@
-name: 下载、重新打包并上传到 Release
+name: 下载、重新打包并上传到 Release (WinRAR 压缩)
 
 on:
   workflow_dispatch:
@@ -22,8 +22,10 @@ jobs:
   process-and-upload:
     runs-on: ubuntu-latest
     steps:
-      - name: 安装 p7zip-full
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq p7zip-full
+      - name: 安装依赖（7z 用于解压，rar 用于压缩）
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq p7zip-full rar
 
       - name: 处理所有任务
         shell: bash
@@ -91,7 +93,7 @@ jobs:
               done
               [[ -f download.pkg ]] || { echo "下载失败"; exit 1; }
 
-              # 解压
+              # 解压（使用 7z 通用解压，支持密码）
               echo "解压..."
               mkdir -p extract
               if [[ -n "$PASSWORD" ]]; then
@@ -113,16 +115,16 @@ jobs:
               fi
               [[ -d "${OUTPUT_NAME}" ]] || { echo "重组失败"; exit 1; }
 
-              # 分卷压缩（最高压缩率，每卷 1.9 GB）
-              echo "最高压缩率分卷 ZIP (每卷 1.9G)..."
-              7z a -tzip -v1900m -mx=9 "${OUTPUT_NAME}.zip" "${OUTPUT_NAME}/"
+              # ========== WinRAR 压缩（RAR5 格式，标准压缩，恢复记录，128MB 字典，分卷 1.9GB）==========
+              echo "WinRAR 分卷压缩 (标准压缩, rr, 128MB 字典)..."
+              rar a -ma5 -m3 -rr -md128m -v1900m "${OUTPUT_NAME}.rar" "${OUTPUT_NAME}/"
 
-              # 上传：匹配所有以 OUTPUT_NAME.zip 开头的文件（涵盖 .zip、.z01、.zip.001 等）
+              # 上传：匹配所有以 OUTPUT_NAME.rar 开头的文件（涵盖 .rar, .part1.rar, .part2.rar 等）
               echo "上传到 release..."
               ASSETS=()
               while IFS= read -r -d '' file; do
                 ASSETS+=("$file")
-              done < <(find . -maxdepth 1 -name "${OUTPUT_NAME}.zip*" -print0 2>/dev/null || true)
+              done < <(find . -maxdepth 1 -name "${OUTPUT_NAME}.rar*" -print0 2>/dev/null || true)
 
               if [[ ${#ASSETS[@]} -eq 0 ]]; then
                 echo "错误：未找到任何压缩分卷文件。"
@@ -133,7 +135,7 @@ jobs:
               gh release upload "${TAG}" "${ASSETS[@]}" --clobber
 
               echo "任务完成：$OUTPUT_NAME"
-              # 退出子shell时自动清理
+              # 子shell退出时自动清理
             ) || echo "⚠️ 任务 $idx 失败，继续下一个"
           done
 
