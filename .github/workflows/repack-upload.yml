@@ -35,10 +35,10 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 清理可能的 Windows 换行符，防止隐藏 \r 干扰
+          # 清理所有 Windows 换行符（包括 JSON 和各字段）
           export TASKS_JSON="$(printf '%s' "$TASKS_JSON" | tr -d '\r')"
 
-          # 容错：移除 JSON 数组/对象末尾多余逗号（支持多行）
+          # 容错：移除 JSON 数组/对象末尾多余逗号
           export TASKS_JSON="$(printf '%s' "$TASKS_JSON" | sed -Ez 's/,\s*(]|})/\1/g')"
 
           COUNT=$(jq -n 'env.TASKS_JSON | fromjson | length')
@@ -52,7 +52,6 @@ jobs:
             echo "release ${TAG} 已存在，将上传 asset"
           fi
 
-          # 逐个任务处理，子 shell 隔离错误并即时清理
           for ((idx=0; idx<COUNT; idx++)); do
             echo "========================================="
             echo ">>> 任务 $((idx+1))/${COUNT}"
@@ -61,8 +60,11 @@ jobs:
               set -euo pipefail
 
               URL=$(jq -rn --argjson i "$idx" 'env.TASKS_JSON | fromjson | .[$i].url')
-              OUTPUT_NAME=$(jq -rn --argjson i "$idx" 'env.TASKS_JSON | fromjson | .[$i].output_name')
+              OUTPUT_NAME_RAW=$(jq -rn --argjson i "$idx" 'env.TASKS_JSON | fromjson | .[$i].output_name')
               PASSWORD=$(jq -rn --argjson i "$idx" 'env.TASKS_JSON | fromjson | .[$i].password // ""')
+
+              # 再次剔除 \r（以防字段级残留）
+              OUTPUT_NAME="$(printf '%s' "$OUTPUT_NAME_RAW" | tr -d '\r')"
 
               if [[ -z "$URL" || -z "$OUTPUT_NAME" ]]; then
                 echo "错误：url 或 output_name 为空，跳过"
@@ -76,7 +78,7 @@ jobs:
 
               cd "$TASK_DIR"
 
-              # 下载（重试三次）
+              # 下载
               echo "下载：$URL"
               for i in 1 2 3; do
                 if curl -fsSL --retry 2 -o download.pkg "$URL"; then
@@ -89,7 +91,7 @@ jobs:
               done
               [[ -f download.pkg ]] || { echo "下载失败"; exit 1; }
 
-              # 解压（带密码支持）
+              # 解压
               echo "解压..."
               mkdir -p extract
               if [[ -n "$PASSWORD" ]]; then
@@ -111,30 +113,29 @@ jobs:
               fi
               [[ -d "${OUTPUT_NAME}" ]] || { echo "重组失败"; exit 1; }
 
-              # 分卷压缩（zip，最高压缩率，每卷1.9G）
+              # 分卷压缩
               echo "最高压缩率分卷 ZIP (每卷 1.9G)..."
               7z a -tzip -v1900m -mx=9 "${OUTPUT_NAME}.zip" "${OUTPUT_NAME}/"
 
-              # 收集所有分卷文件（修正通配符问题）
+              # 调试：列出当前目录所有文件
+              echo "当前目录内容："
+              ls -la
+
+              # 上传：使用 find 安全收集所有分卷文件（包括仅有一卷的情况）
               echo "上传到 release..."
               ASSETS=()
-              # 主 zip 文件
-              if [[ -f "${OUTPUT_NAME}.zip" ]]; then
-                ASSETS+=("${OUTPUT_NAME}.zip")
-              fi
-              # 分卷文件 .z01, .z02 等（使用 find 安全处理特殊字符）
               while IFS= read -r -d '' file; do
                 ASSETS+=("$file")
-              done < <(find . -maxdepth 1 -name "${OUTPUT_NAME}.z[0-9][0-9]" -print0 2>/dev/null || true)
+              done < <(find . -maxdepth 1 \( -name "${OUTPUT_NAME}.zip" -o -name "${OUTPUT_NAME}.z[0-9][0-9]" \) -print0 2>/dev/null || true)
 
               if [[ ${#ASSETS[@]} -eq 0 ]]; then
-                echo "无分卷文件"
+                echo "错误：未找到任何压缩文件（可能文件名不匹配），目录内容如上。"
                 exit 1
               fi
               gh release upload "${TAG}" "${ASSETS[@]}" --clobber
 
               echo "任务完成：$OUTPUT_NAME"
-              # 子shell退出时 trap 自动清理
+              # trap 自动清理
             ) || echo "⚠️ 任务 $idx 失败，继续下一个"
           done
 
