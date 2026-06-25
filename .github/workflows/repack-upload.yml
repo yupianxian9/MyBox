@@ -37,12 +37,15 @@ jobs:
       - name: 处理所有任务
         shell: bash
         env:
-          TASKS_JSON: ${{ github.event.inputs.tasks }}   # 直接存入环境变量，不经过 shell 展开
+          TASKS_JSON: ${{ github.event.inputs.tasks }}
           TAG: ${{ github.event.inputs.tag }}
         run: |
           set -euo pipefail
 
-          # 1. 使用 jq 从环境变量解析任务数量和内容（完全避免 shell 注入）
+          # ---- 容错处理：自动移除 JSON 数组/对象末尾多余的逗号 ----
+          export TASKS_JSON=$(echo "$TASKS_JSON" | sed -E 's/,\s*(]|})/\1/g')
+
+          # 1. 解析任务数量
           COUNT=$(jq -n 'env.TASKS_JSON | fromjson | length')
           echo "共有 ${COUNT} 个任务待处理"
 
@@ -60,7 +63,6 @@ jobs:
             echo "========================================="
             echo "处理第 $((idx+1))/${COUNT} 个任务"
 
-            # 从环境变量中读取当前任务的字段
             URL=$(jq -rn --argjson i "$idx" 'env.TASKS_JSON | fromjson | .[$i].url')
             OUTPUT_NAME=$(jq -rn --argjson i "$idx" 'env.TASKS_JSON | fromjson | .[$i].output_name')
             PASSWORD=$(jq -rn --argjson i "$idx" 'env.TASKS_JSON | fromjson | .[$i].password // ""')
@@ -70,7 +72,7 @@ jobs:
               continue
             fi
 
-            # 创建任务专属临时目录
+            # 创建临时目录
             TASK_DIR=$(mktemp -d -t task-XXXXX)
             echo "临时目录：$TASK_DIR"
 
@@ -155,7 +157,7 @@ jobs:
             }
 
             echo "任务完成：$OUTPUT_NAME 已上传。"
-            # trap 会在函数退出时自动清理 TASK_DIR
+            # trap 自动清理
           done
 
           echo "所有任务处理完毕。"
