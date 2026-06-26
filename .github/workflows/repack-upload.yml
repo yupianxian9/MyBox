@@ -113,9 +113,9 @@ jobs:
               fi
               [[ -d "${OUTPUT_NAME}" ]] || { echo "重组失败"; exit 1; }
 
-              # 分卷压缩（标准压缩率，每卷最大 1.9 GB）
-              echo "压缩（标准压缩率，分卷 1.9G）..."
-              7z a -tzip -v1900m -mx=5 "${OUTPUT_NAME}.zip" "${OUTPUT_NAME}/"
+              # 分卷压缩（最高压缩率，每卷最大 1.9 GB）
+              echo "最高压缩率分卷 ZIP (每卷 1.9G)..."
+              7z a -tzip -v1900m -mx=9 "${OUTPUT_NAME}.zip" "${OUTPUT_NAME}/"
 
               # 智能处理：若最终只有一个分卷（.zip.001），则重命名为标准 .zip
               first_volume="${OUTPUT_NAME}.zip.001"
