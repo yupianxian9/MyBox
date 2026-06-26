@@ -342,14 +342,7 @@ scoop install extras/draw.io
 
 #### WPSOffice_RainCandyTech
 
-描述：金山推出的 WPS Office 办公软件的第三方修改版（雨糖版）。
-
-
-
-#### WPSOffice_RainCandyTech
-
-描述：金山推出的 WPS Office 办公软件的第三方修改版（雨糖版）。
-
+描述：WPS Office（雨糖科技修改版）。
 
 
 #### fab
