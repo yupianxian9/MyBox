@@ -3,5 +3,8 @@
 cn.bing.com##div#sacs_win > div.sacs_popup > div.sacs_mtit
 cn.bing.com##div#sacs_win > div.sacs_popup > div.sacs_con
 cn.bing.com##div#sacs_win
-
+||access.mypikpak.com^$all
+||access.mypikpak.net^$all
+||access.pikpak.me^$all
+||access.pikpakdrive.com^$all
 
