@@ -1,0 +1,148 @@
+name: 下载、重新打包并上传到 Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tasks:
+        description: >
+          JSON 数组，每个元素包含 url, output_name, password。
+          示例：[{"url":"https://...", "output_name":"MyApp", "password":"123"}]
+        required: true
+        type: string
+      tag:
+        description: '目标 Release 的 tag（如 v1.7），不存在则自动创建'
+        required: true
+        type: string
+        default: 'latest'
+
+permissions:
+  contents: write
+
+jobs:
+  process-and-upload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 安装 p7zip-full
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq p7zip-full
+
+      - name: 处理所有任务
+        shell: bash
+        env:
+          TASKS_JSON: ${{ github.event.inputs.tasks }}
+          TAG: ${{ github.event.inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # 清理所有 Windows 换行符（\r）
+          export TASKS_JSON="$(printf '%s' "$TASKS_JSON" | tr -d '\r')"
+
+          # 容错：移除 JSON 末尾多余逗号
+          export TASKS_JSON="$(printf '%s' "$TASKS_JSON" | sed -Ez 's/,\s*(]|})/\1/g')"
+
+          COUNT=$(jq -n 'env.TASKS_JSON | fromjson | length')
+          echo "共有 ${COUNT} 个任务"
+
+          # 确保 release 存在
+          if ! gh release view "${TAG}" &>/dev/null; then
+            echo "创建 release: ${TAG}"
+            gh release create "${TAG}" --title "${TAG}" --notes "自动化重新打包上传"
+          else
+            echo "release ${TAG} 已存在，将上传 asset"
+          fi
+
+          for ((idx=0; idx<COUNT; idx++)); do
+            echo "========================================="
+            echo ">>> 任务 $((idx+1))/${COUNT}"
+
+            (
+              set -euo pipefail
+
+              URL=$(jq -rn --argjson i "$idx" 'env.TASKS_JSON | fromjson | .[$i].url')
+              OUTPUT_NAME_RAW=$(jq -rn --argjson i "$idx" 'env.TASKS_JSON | fromjson | .[$i].output_name')
+              PASSWORD=$(jq -rn --argjson i "$idx" 'env.TASKS_JSON | fromjson | .[$i].password // ""')
+
+              # 再次剔除 \r（确保字段级干净）
+              OUTPUT_NAME="$(printf '%s' "$OUTPUT_NAME_RAW" | tr -d '\r')"
+
+              if [[ -z "$URL" || -z "$OUTPUT_NAME" ]]; then
+                echo "错误：url 或 output_name 为空，跳过"
+                exit 0
+              fi
+
+              TASK_DIR=$(mktemp -d -t task-XXXXX)
+              echo "临时目录：$TASK_DIR"
+              cleanup() { echo "清理 $TASK_DIR"; rm -rf "$TASK_DIR"; }
+              trap cleanup EXIT
+
+              cd "$TASK_DIR"
+
+              # 下载（重试三次）
+              echo "下载：$URL"
+              for i in 1 2 3; do
+                if curl -fsSL --retry 2 -o download.pkg "$URL"; then
+                  echo "下载成功"
+                  break
+                else
+                  echo "重试 $i ..."
+                  sleep 5
+                fi
+              done
+              [[ -f download.pkg ]] || { echo "下载失败"; exit 1; }
+
+              # 解压（带密码支持）
+              echo "解压..."
+              mkdir -p extract
+              if [[ -n "$PASSWORD" ]]; then
+                7z x -oextract -p"$PASSWORD" download.pkg -y
+              else
+                7z x -oextract download.pkg -y
+              fi
+
+              # 重组为单层文件夹
+              echo "重组文件夹结构..."
+              mapfile -t items < <(find extract -mindepth 1 -maxdepth 1)
+              if [[ ${#items[@]} -eq 1 ]] && [[ -d "${items[0]}" ]]; then
+                echo "检测到唯一子目录，上提内容到 ${OUTPUT_NAME}/"
+                mkdir -p "${OUTPUT_NAME}"
+                mv "${items[0]}"/* "${items[0]}"/.[!.]* "${OUTPUT_NAME}"/ 2>/dev/null || true
+              else
+                echo "多文件或非目录，将 extract 作为 ${OUTPUT_NAME}/"
+                mv extract "${OUTPUT_NAME}"
+              fi
+              [[ -d "${OUTPUT_NAME}" ]] || { echo "重组失败"; exit 1; }
+
+              # 分卷压缩（最高压缩率，每卷最大 1.9 GB）
+              echo "最高压缩率分卷 ZIP (每卷 1.9G)..."
+              7z a -tzip -v1900m -mx=7 "${OUTPUT_NAME}.zip" "${OUTPUT_NAME}/"
+
+              # 智能处理：若最终只有一个分卷（.zip.001），则重命名为标准 .zip
+              first_volume="${OUTPUT_NAME}.zip.001"
+              if [[ -f "$first_volume" ]] &&
+                 [[ ! -f "${OUTPUT_NAME}.zip.002" ]] &&
+                 [[ ! -f "${OUTPUT_NAME}.z01" ]]; then
+                echo "只有一卷，重命名 ${first_volume} -> ${OUTPUT_NAME}.zip"
+                mv "$first_volume" "${OUTPUT_NAME}.zip"
+              fi
+
+              # 收集所有分卷文件并上传
+              echo "上传到 release..."
+              ASSETS=()
+              while IFS= read -r -d '' file; do
+                ASSETS+=("$file")
+              done < <(find . -maxdepth 1 -name "${OUTPUT_NAME}.zip*" -print0 2>/dev/null || true)
+
+              if [[ ${#ASSETS[@]} -eq 0 ]]; then
+                echo "错误：未找到任何压缩文件。"
+                ls -la
+                exit 1
+              fi
+              gh release upload "${TAG}" "${ASSETS[@]}" --clobber
+
+              echo "任务完成：$OUTPUT_NAME"
+              # 退出子shell时自动清理
+            ) || echo "⚠️ 任务 $idx 失败，继续下一个"
+          done
+
+          echo "所有任务处理完毕"
