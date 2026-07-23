@@ -1,0 +1,84 @@
+name: Download CWS Extensions & Upload to Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      extensions:
+        description: '扩展信息列表（JSON 数组，包含 name 和 url）。示例：[{"name":"uBlock Origin","url":"https://chromewebstore.google.com/detail/cjpalhdlnbpafiamejdnhcphjbkeiagm"},{"name":"Vimium","url":"https://chromewebstore.google.com/detail/dbepggeogbaibhgnhhndojpepiihcmeb"}]'
+        required: true
+        type: string
+      tag:
+        description: '目标 Release Tag，默认 v1.0'
+        required: false
+        default: 'v1.0'
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  download-and-release:
+    name: 下载 CRX 并按指定名称发布
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout 代码
+        uses: actions/checkout@v4
+
+      - name: 解析参数并下载重命名
+        run: |
+          mkdir -p artifacts
+
+          # 遍历传入的 JSON 数组
+          echo '${{ inputs.extensions }}' | jq -c '.[]' | while read -r item; do
+            # 1. 从输入参数中直接提取自定义名称和下载地址
+            display_name=$(echo "$item" | jq -r '.name')
+            url=$(echo "$item" | jq -r '.url')
+
+            # 2. 从 URL 提取 32 位扩展 ID（仍需用于构造下载链接）
+            ext_id=$(echo "$url" | grep -oE '[a-z]{32}' | head -1)
+            if [ -z "$ext_id" ] || [ "${#ext_id}" != "32" ]; then
+              echo "::error ::无法从 URL 提取 32 位扩展 ID: $url"
+              exit 1
+            fi
+
+            # 3. 安全清洗文件名（移除非法字符、防路径穿越、统一替换空格）
+            safe_name=$(basename "$display_name" | tr '/\\:*?"<>|' '_' | tr ' ' '_' | sed 's/__*/_/g; s/^_//; s/_$//')
+            if [[ "$safe_name" != *.crx ]]; then
+              final_file="${safe_name}.crx"
+            else
+              final_file="$safe_name"
+            fi
+
+            echo "--------------------------------------------------"
+            echo "正在处理: ${display_name} -> ${final_file} (ID: ${ext_id})"
+
+            # 4. 下载 CRX 并直接以最终文件名保存
+            curl -f -L --retry 3 -A "Mozilla/5.0" \
+              -o "artifacts/${final_file}" \
+              "https://clients2.google.com/service/update2/crx?response=redirect&prodversion=122&acceptformat=crx3&x=id%3D${ext_id}%26installsource%3Dondemand%26uc"
+
+            # 5. 基础校验：防止拿到 Google 的错误 HTML 页
+            if [ ! -s "artifacts/${final_file}" ] || file "artifacts/${final_file}" | grep -qi 'html\|text'; then
+              echo "::warning ::${ext_id} 下载内容异常或被拦截，已跳过。"
+              rm -f "artifacts/${final_file}"
+            else
+              echo "✓ 成功保存: ${final_file}"
+            fi
+          done
+
+          echo ""
+          echo "--- 待上传文件列表 ---"
+          ls -lh artifacts/ || echo "无有效文件可上传"
+
+      - name: 发布到 GitHub Release (${{ inputs.tag }})
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          name: ${{ inputs.tag }}
+          body: |
+            🤖 由 GitHub Actions 自动下载自 Chrome Web Store。
+            文件名已按输入参数映射为指定名称。
+          files: artifacts/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
