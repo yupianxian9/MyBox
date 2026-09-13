@@ -1,0 +1,131 @@
+name: Vivaldi Android arm64 APK 归档
+
+on:
+  schedule:
+    # GitHub Actions 的 cron 一律使用 UTC 时间：每月 1 号 00:00 UTC 触发
+    # 对应北京时间每月 1 号 08:00
+    - cron: '0 0 1 * *'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: '目标 Release 的 tag'
+        required: false
+        default: 'v1.0'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: vivaldi-arm64-apk
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # schedule 触发时无 inputs，回退到默认 tag
+      RELEASE_TAG: ${{ github.event.inputs.release_tag || 'v1.0' }}
+      # 官方页面（按顺序尝试），HTML 中含各架构的 CDN 直链
+      DOWNLOAD_PAGES: https://vivaldi.com/download/ https://vivaldi.com/android/ https://vivaldi.com/
+      CDN_BASE: https://downloads.vivaldi.com/stable/       # 官方 CDN
+    steps:
+      # 严格闸门：定时触发时必须同时满足 UTC 与北京时间的日期都是 1 号；手动触发不受限制
+      - name: 运行时间闸门
+        id: gate
+        run: |
+          set -euo pipefail
+          utc_day=$(date -u +%d)
+          cst_day=$(TZ=Asia/Shanghai date +%d)
+          if [ "${{ github.event_name }}" = "schedule" ] && { [ "$utc_day" != "01" ] || [ "$cst_day" != "01" ]; }; then
+            echo "::notice::当前非 1 号（UTC=$utc_day / 北京=$cst_day），严格跳过"
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # 从官方页面解析当前最新的 arm64-v8a 直链（形如 Vivaldi.8.1.4099.146_arm64-v8a.apk）
+      - name: 解析最新 arm64 直链
+        id: resolve
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          url=""
+          for page in $DOWNLOAD_PAGES; do
+            html=$(curl -fsSL --retry 3 --max-time 60 "$page" || true)
+            # 先取全部匹配再取第一行，避免管道过早关闭导致 SIGPIPE
+            links=$(printf '%s' "$html" | grep -oE "${CDN_BASE}Vivaldi\.[0-9]+(\.[0-9]+)*_arm64-v8a\.apk" || true)
+            url=$(printf '%s' "$links" | sed -n '1p')
+            if [ -n "$url" ]; then break; fi
+          done
+          if [ -z "$url" ]; then
+            echo "::error::未能在官方页面解析到 arm64 APK 链接"
+            exit 1
+          fi
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "version=$(basename "$url" | sed -E 's/^Vivaldi\.([0-9.]+)_arm64-v8a\.apk$/\1/')" >> "$GITHUB_OUTPUT"
+
+      # -O：沿用服务器上的文件名，不做任何重命名
+      - name: 下载 APK
+        id: download
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          url="${{ steps.resolve.outputs.url }}"
+          curl -fL --retry 3 --retry-delay 5 --max-time 1800 --no-progress-meter -O "$url"
+          apk_file=$(basename "$url")
+          # APK 本质是 ZIP，用文件头做一次完整性校验
+          if [ "$(head -c 2 "$apk_file")" != "PK" ]; then
+            echo "::error::下载产物不是有效的 APK/ZIP 文件"
+            exit 1
+          fi
+          echo "file=$apk_file" >> "$GITHUB_OUTPUT"
+          echo "size=$(du -h "$apk_file" | cut -f1)" >> "$GITHUB_OUTPUT"
+
+      # release 不存在则创建；同名文件已存在则跳过上传
+      - name: 上传到 Release
+        id: upload
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          file="${{ steps.download.outputs.file }}"
+          tag="$RELEASE_TAG"
+          repo="$GITHUB_REPOSITORY"
+
+          if ! gh release view "$tag" --repo "$repo" >/dev/null 2>&1; then
+            echo "Release $tag 不存在，先创建"
+            gh release create "$tag" --repo "$repo" --title "$tag" \
+              --notes "自动归档 Vivaldi Android arm64 APK"
+          fi
+
+          # 注意：gh 的 --jq 只接一个表达式参数，不能写成 --jq -r '...'
+          # 否则 -r 会被当作 --jq 的值，表达式变成第 2 个位置参数，
+          # 而 gh release view 最多只接受 1 个位置参数 → accepts at most 1 arg(s), received 2
+          assets=$(gh release view "$tag" --repo "$repo" --json assets --jq '.assets[].name')
+          exists=false
+          while IFS= read -r name; do
+            name="${name%\"}"; name="${name#\"}"   # 兼容个别版本输出带引号的字符串
+            if [ "$name" = "$file" ]; then
+              exists=true
+              break
+            fi
+          done <<< "$assets"
+
+          if [ "$exists" = true ]; then
+            echo "::notice::$tag 中已存在 $file，跳过上传"
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+          else
+            gh release upload "$tag" "$file" --repo "$repo" --clobber
+            echo "skipped=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 输出摘要
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          {
+            echo "### Vivaldi Android arm64 APK"
+            echo "- 版本：${{ steps.resolve.outputs.version }}"
+            echo "- 文件：\`${{ steps.download.outputs.file }}\`（${{ steps.download.outputs.size }}）"
+            echo "- 目标 Release：\`$RELEASE_TAG\`"
+            echo "- 上传结果：${{ steps.upload.outputs.skipped == 'true' && '已存在，跳过' || '已上传' }}"
+          } >> "$GITHUB_STEP_SUMMARY"

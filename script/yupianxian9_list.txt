@@ -1,0 +1,5 @@
+[Adblock Plus 2.0]
+! Version: v1.0
+! Title: yupianxian9_list
+cn.bing.com###bnp_container
+cn.bing.com##.cn_related_search_upsell_container
